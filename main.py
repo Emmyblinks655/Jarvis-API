@@ -1,60 +1,83 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import requests
+from typing import List
 
-app = FastAPI(title="Casanova Personal AI API", version="1.0")
+app = FastAPI(title="Jarvis Personal AI API", version="1.0")
 
-MEMORY_STORE = []
+# Simple in-memory memory store (persist to Postgres later)
+MEMORY_STORE: List[str] = []
 
 class PromptRequest(BaseModel):
     prompt: str
     use_web: bool = False
 
+class MemoryItem(BaseModel):
+    note: str
+
 @app.get("/")
-def home():
-    return {"status": "online", "owner": "Casanova"}
+async def home():
+    return {"status": "online", "owner": "Casanova (Jarvis)"}
 
 @app.post("/chat")
-def chat_with_brain(req: PromptRequest):
+async def chat_with_brain(req: PromptRequest):
+    # 1) optional web search context
     web_context = ""
     if req.use_web:
         try:
-            search_url = f"https://api.duckduckgo.com/?q={req.prompt}&format=json"
-            res = requests.get(search_url).json()
-            abstract = res.get("AbstractText", "")
+            q = requests.utils.requote_uri(req.prompt)
+            r = requests.get(f"https://api.duckduckgo.com/?q={q}&format=json&no_redirect=1")
+            data = r.json()
+            abstract = data.get("AbstractText", "")
             if abstract:
-                web_context = f"Web search context: {abstract}\n\n"
+                web_context = f"Web search context:\n{abstract}\n\n"
         except Exception:
-            web_context = "Web search failed.\n\n"
+            web_context = "(web search failed)\n\n"
 
-    memories_str = "\n".join(MEMORY_STORE[-5:])
+    # 2) memory context (last 10 items)
+    memories_str = "\n".join(MEMORY_STORE[-10:])
     full_prompt = f"User Memories:\n{memories_str}\n\n{web_context}User Request: {req.prompt}"
 
+    # 3) call Gemini (requires GEMINI_API_KEY in env)
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     if not gemini_api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured in environment variables.")
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={gemini_api_key}"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "contents": [{"parts": [{"text": full_prompt}]}]
+        "content": [{"type": "text", "text": full_prompt}]
     }
 
-    ai_response = requests.post(url, headers=headers, json=payload).json()
-    
     try:
-        reply = ai_response["candidates"][0]["content"]["parts"][0]["text"]
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        ai_json = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Model request failed: {e}")
+
+    # parse response (best-effort)
+    reply = ai_json
+    try:
+        # support different response shapes; prefer candidates/...parts
+        if isinstance(ai_json, dict):
+            # new style: "candidates" -> content -> parts
+            c = ai_json.get("candidates")
+            if c and isinstance(c, list):
+                reply = c[0]["content"][0]["text"]
+            else:
+                # try other path
+                reply = ai_json.get("output", ai_json)
     except Exception:
-        reply = f"Error parsing model response: {ai_response}"
+        reply = ai_json
 
     return {"response": reply, "memory_count": len(MEMORY_STORE)}
 
 @app.post("/memory")
-def save_memory(note: str):
-    MEMORY_STORE.append(note)
-    return {"status": "saved", "note": note}
+async def save_memory(item: MemoryItem):
+    MEMORY_STORE.append(item.note)
+    return {"status": "saved", "note": item.note, "memory_count": len(MEMORY_STORE)}
 
 @app.get("/memory")
-def get_memories():
+async def get_memories():
     return {"memories": MEMORY_STORE}
